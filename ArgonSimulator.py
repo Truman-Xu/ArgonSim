@@ -64,6 +64,10 @@ class ArgonSim:
             list(combinations(range(len(self.init_coords)),2))
         )
         self.coords = None
+        self.r_ij = None
+        self.cutoff_ids = None
+        self._potential_pairs = None
+        self.potentials = None
         self.last_coords = None
         self.accl = None
         self._init_step()
@@ -145,6 +149,46 @@ class ArgonSim:
         '''
         return self.lj_coef*((self.sigma/r)**12-(self.sigma/r)**6)
     
+    def _find_cutoff_ids(self):
+        cutoff_mask = np.logical_and(
+            self.r_ij <= self.lennard_jones_cutoff,
+            self.r_ij > 0
+        )
+        return np.nonzero(cutoff_mask)[0]
+
+    def get_cutoff_ids(self):
+        """Get the indices of r_ij that need are within the 2.5 sigma cutoff
+        """
+        if self.cutoff_ids is None:
+            self.cutoff_ids = self._find_cutoff_ids()
+        return self.cutoff_ids
+
+    def _compute_pair_potentials(self):
+        """Compute the potentials from the cutoff list only. Return pairwise
+        potentials of atoms"""
+        return self.lennard_jones(self.r_ij[self.cutoff_ids])
+
+    def get_potentials(self):
+        """Get Lennard Jones potentials from the distance matrix (list form) 
+        based on the distance cutoffs (2.5 sigma). The overall potentials from 
+        the id pairs in the current id_cutoff list will be evalutated and summed
+        up for each atoms.
+            
+        Return
+            potentials
+            param : array of potentials of size N
+            type : np.array
+        """
+        if self._potential_pairs is None:
+            self._potential_pairs = self._compute_pair_potentials()
+        
+        atom_potentials = np.zeros(self.coords.shape[0])
+        effective_id_pairs = self.id_pairs[self.cutoff_ids]
+        for (i, j), p in zip(effective_id_pairs, self._potential_pairs):
+            atom_potentials[i] += p # potentials j to i
+            atom_potentials[j] += p # potentials i to j
+        return atom_potentials
+
     def get_accelerations(self, coords):
         """
         Get accelerations from a set of coordinates. The pairwaise distance 
@@ -168,27 +212,25 @@ class ArgonSim:
         dist_vecs = coords[id_pairs][:,0] - coords[id_pairs][:,1]
         # apply periodic boundary conditions
         self._apply_pbc_dist(dist_vecs)
-        # pairwise euclidean distances from atom j to atom i
-        r_ij = LA.norm(dist_vecs, axis = 1)
-        cutoff_mask = np.logical_and(
-            r_ij <= self.lennard_jones_cutoff,
-            r_ij > 0
-        )
-        # indices of r_ij that need are within the cutoff
-        cutoff_ids = np.nonzero(cutoff_mask)[0]
-        # pairwise potentials
-        potentials = self.lennard_jones(r_ij[cutoff_ids])
-        # pairwise force vectors (x,y,z) from atom j to atom i
-        forces = (dist_vecs[cutoff_ids].T * potentials / r_ij[cutoff_ids]).T
+        # update the pairwise euclidean distances from atom j to atom i
+        self.r_ij = LA.norm(dist_vecs, axis = 1)
+        # update the indices of r_ij that need are within the 2.5 sigma cutoff
+        self.cutoff_ids = self._find_cutoff_ids()
+        # update pairwise potentials
+        self._potential_pairs = self._compute_pair_potentials()
+        # calculate pairwise force vectors (x,y,z) from atom j to atom i
+        forces = (
+            dist_vecs[self.cutoff_ids].T * self._potential_pairs / self.r_ij[self.cutoff_ids]
+        ).T
         # indices pair that are within cutoff
-        effective_id_pairs = id_pairs[cutoff_ids]
+        effective_id_pairs = id_pairs[self.cutoff_ids]
         # force vectors for each atom 
-        f_ij = np.zeros(coords.shape)
+        f_atoms = np.zeros(coords.shape)
         for (i, j), f in zip(effective_id_pairs, forces):
-            f_ij[i] += f # force j to i
-            f_ij[j] -= f # force i to j
+            f_atoms[i] += f # force j to i
+            f_atoms[j] -= f # force i to j
         # acceleration
-        accl = f_ij/(self.m_argon_kg)
+        accl = f_atoms/(self.m_argon_kg)
         return accl
 
     def _init_step(self):

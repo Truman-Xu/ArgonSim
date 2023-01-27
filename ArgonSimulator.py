@@ -1,55 +1,28 @@
+# Brooks Lab at the University of Michigan, 2023
+
+"""Argon MD simulation engine based on Verlet algorithm"""
 from itertools import combinations, permutations
 import numpy as np
 from numpy import linalg as LA
-from scipy import ndimage as ni
-from numba import uint32, float32, float64    # import the types
-from numba.experimental import jitclass
+from scipy import ndimage as NI   # import the types
 
-spec = [
-    # class default attr
-    ('n_cell', uint32),
-    ('m_argon', float32),
-    ('m_argon_kg', float32),
-    ('kb', float32),
-    ('sigma', float32),
-    ('lennard_jones_cutoff', float32),
-    # instance attr
-    ('temp', float32),
-    ('dt', float32),
-    ('box_len', float32),
-    ('lj_coef', float64),
-    ('init_coord', float64[:,:]),
-    ('_idx_array', uint32[:]),
-    ('velo', float64[:,:]),
-    ('id_pairs', uint32[:,:]),
-    ('coords', float64[:,:]),
-    ('r_ij', float64[:,:]),
-    ('cutoff_ids', uint32[:,:]),
-    ('_pair_potentials', float64[:,:]),
-    ('potentials', float64[:,:]),
-    ('last_coords', float64[:,:]),
-    ('accl', float64[:,:])
-]
-
-@jitclass(spec)
 class ArgonSim:
     """Simple molecular dynamics simulation engine for Argon systems. This is a
     reimplementation of the Verlet paper on Phys Review, 1976 except that this
     simulator does not use the reduced unit as Verlet did."""
-    n: float = 6.0221415e23 # /mol
-    m_argon: float = 39.948/n # gram
-    m_argon_kg: float = m_argon*1e-3 # mass of one Argon atom in kg
-    kb: float = 1.3806503e-23 # J/K
+    n = 6.0221415e23 # /mol
+    m_argon = 39.948/n # gram
+    m_argon_kg = m_argon*1e-3 # mass of one Argon atom in kg
+    kb = 1.3806503e-23 # J/K
     # characteristic length for lennard jones
-    sigma: float = 3.4e-10 # m
-    # 2.5 sigma is set as lennard jones potential cutoff
-    lennard_jones_cutoff: float = 2.5*sigma
+    sigma = 3.405e-10 # m
     def __init__(
         self,
         n_cells : int,
         temp : float = 120,
-        dt : float = 1e-14,
-        rho : float = 1.374 # g/cm^3 @ 130K
+        dt : float = 1e-14, # seconds
+        density : float = 1.16, # g/cm^3 @ 130K
+        lennard_jones_cutoff : float = 2.5 # 2.5 sigma is set as lennard jones potential cutoff
     ):
         """
         Initialize the system by specifying the number of face-centered cubic 
@@ -73,32 +46,33 @@ class ArgonSim:
                     value is set to 1 X 10^-14 s.
             type : float
 
-            rho
+            density
             param : Density of the Argon system, unit in g/cm^3. Default to 
-                    1.374 g/cm^3 (@130K)
+                    1.16 g/cm^3 (@130K)
             type : float
         """
         if not isinstance(n_cells, int):
             raise TypeError(
                 "Integer value is required to specify the number of unit cells"
             )
-        self.temp = temp # Kelvin
         self.dt = dt # second
-        L = (self.m_argon*864/rho)**(1/3) # centimeter
+        n_atoms = 4*n_cells**3
+        L = (self.m_argon*n_atoms/density)**(1/3) # centimeter
+        self.lennard_jones_cutoff = lennard_jones_cutoff * self.sigma
         self.box_len = L * 1e-2 # system dimension in meters
-        self.lj_coef = 4*120*self.kb # Lennard Jones energy coeff
+        self.lj_coef = 4*119.8*self.kb # Lennard Jones energy coeff
+        self.del_pot_coef = 12*self.lj_coef # potential gradient coeff
         self.init_coords = self._init_coords(self.box_len, n_cells) # meters
         self._idx_array = np.arange(self.init_coords.shape[0])
-        self.velo = self._init_velocities(self.temp, self.init_coords.shape)
+        self.velo = self._init_velocities(temp, self.init_coords.shape)
         # combination of indices (i, j) for atom i and atom j
         self.id_pairs = np.array(
             list(combinations(range(len(self.init_coords)),2))
         )
-        self.coords = np.empty_like(self.init_coords, dtype=float)
+        self.coords = np.empty_like(self.init_coords, dtype=np.float64)
         self.r_ij = None
         self.cutoff_ids = None
-        self._pair_potentials = None
-        self.potentials = None
+        self.pair_potentials = None
         self.last_coords = None
         self.accl = None
         self._init_step()
@@ -109,7 +83,7 @@ class ArgonSim:
         """
         cell_len = box_len/n_cells
         x_corner = np.linspace(0, box_len-cell_len, n_cells) # corner atom spacings
-        x_face = np.linspace(cell_len/2,box_len-cell_len/2, n_cells) # face atom spacings
+        x_face = np.linspace(cell_len/2, box_len-cell_len/2, n_cells) # face atom spacings
 
         grid_c = np.meshgrid(x_corner, x_corner, x_corner, indexing='ij')
         grid_f = np.meshgrid(x_face, x_corner, x_face, indexing='ij')
@@ -121,7 +95,8 @@ class ArgonSim:
         coords = np.concatenate([face_coords, corner_coords], axis = 1).T
         return coords
     
-    def _init_velocities(self, temp, size) -> np.ndarray:
+    @staticmethod
+    def _init_velocities(temp, size) -> np.ndarray:
         """Initialize velocities for each atom from a Maxwell-Boltzmann 
         distribution"""
         kbT_over_m = 1.3806503*temp/(39.948e-3*6.0221415**(-1)) # m^2/s^2
@@ -129,7 +104,8 @@ class ArgonSim:
         init_velo = np.random.normal(0, velo_std, size)
         return init_velo
     
-    def get_speeds(self, velocities) -> np.ndarray:
+    @ staticmethod
+    def get_speeds(velocities) -> np.ndarray:
         """Get speed for a given array of velocities.
         - Args
             velocities
@@ -144,98 +120,100 @@ class ArgonSim:
         """
         return LA.norm(velocities, axis = 1)
     
-    def _apply_pbc_dist(self, d_vecs: float64) -> None:
+    @ staticmethod
+    def _apply_pbc_dist(dist_vecs, box_len) -> None:
         """Apply periodic boundary conditions on distance vectors. Shortest 
-        distance will be determined from self.box_length and assigned to the 
-        distance array directly"""
-        mask1 = d_vecs > self.box_len/2
-        mask2 = d_vecs < -self.box_len/2
-        new_vecs1 = self.box_len - d_vecs[mask1]
-        new_vecs2 = self.box_len + d_vecs[mask2]
-        d_vecs[mask1] = new_vecs1
-        d_vecs[mask2] = new_vecs2
+        distance vector will be determined from self.box_length and assigned 
+        to the distance array directly"""
+        mask = np.abs(dist_vecs) > box_len/2
+        dist_vecs[mask] = dist_vecs[mask] - np.sign(dist_vecs[mask])*box_len
 
-    def _apply_pbc_coord(self, coords: float64) -> None:
+    @staticmethod
+    def _apply_pbc_coord(coords, box_len) -> None:
         """Apply periodic boundary conditions on coordinates. Any out of bound 
         coord will be wrapped and place to the other side of the box. The new 
         coords will be assigned to the self.coords array directly"""
-        mask1 = coords > self.box_len
+        mask1 = coords > box_len
         mask2 = coords < 0
-        wrapped_coords1 = coords[mask1] % self.box_len
-        wrapped_coords2 = self.box_len - ((-coords[mask2]) % self.box_len)
+        wrapped_coords1 = coords[mask1] % box_len
+        wrapped_coords2 = box_len - ((-coords[mask2]) % box_len)
         coords[mask1] = wrapped_coords1
         coords[mask2] = wrapped_coords2
 
     @staticmethod
-    def verlet(curr_x, last_x, dt, accl) -> np.ndarray:
+    def verlet(curr_x, last_x, accl, dt) -> np.ndarray:
         """Verlet algorithm"""
-        return 2*(curr_x)-last_x+accl*dt**2
+        return 2*curr_x-last_x+accl*dt**2
 
-    def lennard_jones(self, r: float64[:]) -> np.ndarray:
+    @staticmethod
+    def lennard_jones(lj_coeff, sigma, r) -> np.ndarray:
         ''' 
         Lennard-Jones potentials
-        v_LJ(r) = 4e[(sigma/r)^12-(sigma/4)^6]
+        v_LJ(r) = 4*epsilon[(sigma/r)^12-(sigma/r)^6]
         units in J
         epsilon/k_b = 120K => epsilon: J (m^2 kg s^-2)
         '''
-        return self.lj_coef*((self.sigma/r)**12-(self.sigma/r)**6)
-    
-    def _find_cutoff_ids(self) -> np.ndarray:
-        cutoff_mask = np.logical_and(
-            self.r_ij <= self.lennard_jones_cutoff,
-            self.r_ij > 0
-        )
-        return np.nonzero(cutoff_mask)[0]
-
-    def get_cutoff_ids(self) -> np.ndarray:
-        """Get the indices of r_ij that need are within the 2.5 sigma cutoff
-        """
-        if self.cutoff_ids is None:
-            self.cutoff_ids = self._find_cutoff_ids()
-        return self.cutoff_ids
-
-    def _compute_pair_potentials(self):
-        """Compute the potentials from the cutoff list only. Return pairwise
-        potentials of atoms"""
-        return self.lennard_jones(self.r_ij[self.cutoff_ids])
+        return lj_coeff*((sigma/r)**12-(sigma/r)**6)
 
     @staticmethod
-    def _sum_pair_values_1d(
-            pair_values_1d: float64[:],
-            pair_labels: uint32[:],
-            idx_array: uint32[:]
-        ) -> np.ndarray:
+    def del_potential(dp_coef, r, dist_vecs):
+        """Gradient operator on Lennard Jones potentials to find force vectors
         """
-        Sum pairwise values (i,j pairs) according the label ids. The directions
-        of the pairwise values (e.g. forces, potentials) are taken into account.
-        """
-        # force/potential j to i
-        val_in = ni.sum(pair_values_1d, pair_labels[:,0], idx_array)
-        # force/potential i to j
-        val_out = ni.sum(pair_values_1d, pair_labels[:,1], idx_array)
-        val_total = val_in - val_out
-        return val_total
+        return dp_coef*dist_vecs*r**(-2)*((3.405e-10/r)**12-0.5*(3.405e-10/r)**6)
 
-    def get_potentials(self) -> np.ndarray:
-        """Get Lennard Jones potentials from the distance matrix (list form) 
-        based on the distance cutoffs (2.5 sigma). The overall potentials from 
-        the id pairs in the current id_cutoff list will be evalutated and summed
-        up for each atoms.
-            
-        Return
-            potentials
-            param : array of potentials of size N
-            type : np.array
-        """
-        if self._pair_potentials is None:
-            self._pair_potentials = self._compute_pair_potentials()
-        
-        atom_potentials = np.zeros(self.coords.shape[0])
-        effective_id_pairs = self.id_pairs[self.cutoff_ids]
-        atom_potentials = self._sum_pair_values_1d(
-            self._pair_potentials, effective_id_pairs, self._idx_array
+    def _find_cutoff_ids(self) -> np.ndarray:
+        cutoff_mask = self.r_ij <= self.lennard_jones_cutoff
+        return np.nonzero(cutoff_mask)[0]
+
+    def _compute_pair_potentials(self) -> np.ndarray:
+        """Compute the potentials from the cutoff list only. Return pairwise
+        potentials of atoms"""
+        pair_potentials = self.lennard_jones(
+            self.lj_coef,
+            self.sigma,
+            self.r_ij[self.cutoff_ids]
         )
-        return atom_potentials
+        return pair_potentials
+
+    @staticmethod
+    def _sum_pair_forces_1d(pair_forces_1d, pair_labels, idx_array) -> np.ndarray:
+        """
+        Sum pairwise forces (i,j pairs) according the label ids. The directions
+        of the pairwise forces are taken into account.
+        """
+        # force j to i
+        f_in = NI.sum(pair_forces_1d, pair_labels[:,0], idx_array)
+        # force i to j
+        f_out = NI.sum(pair_forces_1d, pair_labels[:,1], idx_array)
+        f_total = f_in - f_out
+        return f_total
+
+    @staticmethod
+    def _sum_pair_forces(pair_forces, pair_labels, coords_shape) -> np.ndarray:
+        """
+        Sum pairwise forces (i,j pairs) according the label ids. The directions
+        of the pairwise forces are taken into account.
+        """
+        
+        f_total = np.zeros(coords_shape)
+        for pair_idx, (i, j) in enumerate(pair_labels):
+            # force j to i
+            f_total[i] += pair_forces[pair_idx]
+            # force i to j
+            f_total[j] -= pair_forces[pair_idx]
+        return f_total
+
+    def _get_atom_forces_ni_sum(self, pair_forces, pair_labels):
+        # calculate pairwise force vectors (fx,fy,fz) from atom j to atom i
+        fx, fy, fz = pair_forces.T
+        # force vectors for each atom
+        f_atoms = np.empty(self.coords.shape)
+        for i, f1d in enumerate((fx, fy, fz)):
+            # sum all pairwise forces by each dimension on each atom
+            f_atoms[:,i] = self._sum_pair_forces_1d(
+                f1d, pair_labels, self._idx_array
+            )
+        return f_atoms
 
     def get_accelerations(self, coords) -> np.ndarray:
         """
@@ -257,29 +235,22 @@ class ArgonSim:
         """
         id_pairs = self.id_pairs
         # dist vector from atom j to atom i
-        dist_vecs = coords[id_pairs][:,0] - coords[id_pairs][:,1]
-        # apply periodic boundary conditions
-        self._apply_pbc_dist(dist_vecs)
+        dist_vecs = coords[id_pairs[:,0]] - coords[id_pairs[:,1]]
+        # apply periodic boundary conditions on distances
+        self._apply_pbc_dist(dist_vecs, self.box_len)
         # update the pairwise euclidean distances from atom j to atom i
         self.r_ij = LA.norm(dist_vecs, axis = 1)
         # update the indices of r_ij that need are within the 2.5 sigma cutoff
         self.cutoff_ids = self._find_cutoff_ids()
-        # update pairwise potentials
-        self._pair_potentials = self._compute_pair_potentials()
-        # calculate pairwise force vectors (x,y,z) from atom j to atom i
-        pair_forces = (
-            dist_vecs[self.cutoff_ids].T * self._pair_potentials / self.r_ij[self.cutoff_ids]
-        ).T
         # indices pair that are within cutoff
-        effective_id_pairs = id_pairs[self.cutoff_ids]
-        # force vectors for each atom
-        f_atoms = np.empty(coords.shape)
-        fx, fy, fz = pair_forces.T
-        for i, f in enumerate((fx, fy, fz)):
-            # sum all pairwise forces by each dimension on each atom
-            f_atoms[:,i] = self._sum_pair_values_1d(
-                f, effective_id_pairs, self._idx_array
-            )
+        effective_id_pairs = self.id_pairs[self.cutoff_ids]
+        # pair forces from del operator
+        pair_forces = self.del_potential(
+            self.del_pot_coef,
+            self.r_ij.reshape(-1,1)[self.cutoff_ids],
+            dist_vecs[self.cutoff_ids]
+        )
+        f_atoms = self._get_atom_forces_ni_sum(pair_forces, effective_id_pairs)
         # acceleration
         accl = f_atoms/(self.m_argon_kg)
         return accl
@@ -288,22 +259,33 @@ class ArgonSim:
         """The first two steps calculated using the taylor series expansion
         for t=0 and t+∆t"""
         self.accl = self.get_accelerations(self.init_coords)
+        self.pair_potentials = self._compute_pair_potentials()
+        self.coords = self.init_coords+self.velo*self.dt+self.accl*self.dt**2/2
+        self._apply_pbc_coord(self.coords, self.box_len)
         self.last_coords = self.init_coords
-        self.coords = self.last_coords+self.velo*self.dt+self.accl*self.dt**2/2
-        self._apply_pbc_coord(self.coords)
-        self.accl = self.get_accelerations(self.coords)
 
     def step(self) -> None:
         """
         Advance the simulation for one time step ∆t. New velocities, 
         accelerations, coordinates, and last coordinates will be updated."""
+        self.accl = self.get_accelerations(self.coords)
+        self.pair_potentials = self._compute_pair_potentials()
         new_coords = self.verlet(
-            self.coords, self.last_coords, self.dt, self.accl
+            self.coords, self.last_coords, self.accl, self.dt
         )
-        self.velo = (new_coords - self.last_coords)/(2*self.dt)
-        self._apply_pbc_coord(new_coords)
-        self.accl = self.get_accelerations(new_coords)
+        self._apply_pbc_coord(new_coords, self.box_len)
+        dx_2dt = new_coords - self.last_coords
+        self._apply_pbc_dist(dx_2dt, self.box_len)
+        self.velo = dx_2dt/(2*self.dt)
         self.last_coords = self.coords
         self.coords = new_coords
+
+    def step_velocity_verlet(self) -> None:
+        self.coords = self.coords+self.velo*self.dt+self.accl*self.dt**2/2
+        self._apply_pbc_coord(self.coords, self.box_len)
+        self.velo = self.velo+self.accl*self.dt/2
+        self.accl = self.get_accelerations(self.coords)
+        self.pair_potentials = self._compute_pair_potentials()
+        self.velo = self.velo+self.accl*self.dt/2
 
     

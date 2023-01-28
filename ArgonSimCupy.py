@@ -1,10 +1,10 @@
 # Brooks Lab at the University of Michigan, 2023
 
-"""Argon MD simulation engine based on Verlet algorithm"""
+"""Argon MD simulation engine based on Verlet algorithm implemented with cupy"""
 from itertools import combinations, permutations
-import numpy as np
-from numpy import linalg as LA
-from scipy import ndimage as NI   # import the types
+import cupy as cp
+from cupy import linalg as LA
+from cupyx.scipy import ndimage as NI
 
 class ArgonSim:
     """Simple molecular dynamics simulation engine for Argon systems. This is a
@@ -63,13 +63,13 @@ class ArgonSim:
         self.lj_coef = 4*119.8*self.kb # Lennard Jones energy coeff
         self.del_pot_coef = 12*self.lj_coef # potential gradient coeff
         self.init_coords = self._init_coords(self.box_len, n_cells) # meters
-        self._idx_array = np.arange(self.init_coords.shape[0])
+        self._idx_array = cp.arange(self.init_coords.shape[0])
         self.velo = self._init_velocities(temp, self.init_coords.shape)
         # combination of indices (i, j) for atom i and atom j
-        self.id_pairs = np.array(
+        self.id_pairs = cp.array(
             list(combinations(range(len(self.init_coords)),2))
         )
-        self.coords = np.empty_like(self.init_coords, dtype=np.float64)
+        self.coords = cp.empty_like(self.init_coords, dtype=cp.float64)
         self.r_ij = None
         self.cutoff_ids = None
         self.pair_potentials = None
@@ -77,31 +77,31 @@ class ArgonSim:
         self.accl = None
         self._init_step()
         
-    def _init_coords(self, box_len, n_cells) -> np.ndarray:
+    def _init_coords(self, box_len, n_cells) -> cp.ndarray:
         """
         Initialize coordinates in face centered cubic unit cells
         """
         cell_len = box_len/n_cells
-        x_corner = np.linspace(0, box_len-cell_len, n_cells) # corner atom spacings
-        x_face = np.linspace(cell_len/2, box_len-cell_len/2, n_cells) # face atom spacings
+        x_corner = cp.linspace(0, box_len-cell_len, n_cells) # corner atom spacings
+        x_face = cp.linspace(cell_len/2, box_len-cell_len/2, n_cells) # face atom spacings
 
-        grid_c = np.meshgrid(x_corner, x_corner, x_corner, indexing='ij')
-        grid_f = np.meshgrid(x_face, x_corner, x_face, indexing='ij')
+        grid_c = cp.meshgrid(x_corner, x_corner, x_corner, indexing='ij')
+        grid_f = cp.meshgrid(x_face, x_corner, x_face, indexing='ij')
         # get all 3 face nodes by combinations of grid_f
-        grid_3f = np.array(tuple(permutations(grid_f))[:3]).reshape((3,3,-1))
-        face_coords = np.concatenate(grid_3f, axis = 1)
-        corner_coords = np.array(grid_c).reshape((3,-1))
+        grid_3f = cp.array(tuple(permutations(grid_f))[:3]).reshape((3,3,-1))
+        face_coords = cp.concatenate(grid_3f, axis = 1)
+        corner_coords = cp.array(grid_c).reshape((3,-1))
         # N x 3 coords array
-        coords = np.concatenate([face_coords, corner_coords], axis = 1).T
+        coords = cp.concatenate([face_coords, corner_coords], axis = 1).T
         return coords
     
     @staticmethod
-    def _init_velocities(temp, size) -> np.ndarray:
+    def _init_velocities(temp, size) -> cp.ndarray:
         """Initialize velocities for each atom from a Maxwell-Boltzmann 
         distribution"""
         kbT_over_m = 1.3806503*temp/(39.948e-3*6.0221415**(-1)) # m^2/s^2
         velo_std = (kbT_over_m)**0.5 # m/s
-        init_velo = np.random.normal(0, velo_std, size)
+        init_velo = cp.random.normal(0, velo_std, size)
         return init_velo
     
     @ staticmethod
@@ -109,8 +109,8 @@ class ArgonSim:
         """Apply periodic boundary conditions on distance vectors. Shortest 
         distance vector will be determined from self.box_length and assigned 
         to the distance array directly"""
-        mask = np.abs(dist_vecs) > box_len/2
-        dist_vecs[mask] -= np.sign(dist_vecs[mask])*box_len
+        mask = cp.abs(dist_vecs) > box_len/2
+        dist_vecs[mask] -= cp.sign(dist_vecs[mask])*box_len
 
     @staticmethod
     def _apply_pbc_coord(coords, box_len) -> None:
@@ -125,12 +125,12 @@ class ArgonSim:
         coords[mask2] = wrapped_coords2
 
     @staticmethod
-    def verlet(curr_x, last_x, accl, dt) -> np.ndarray:
+    def verlet(curr_x, last_x, accl, dt) -> cp.ndarray:
         """Verlet algorithm"""
         return 2*curr_x-last_x+accl*dt**2
 
     @staticmethod
-    def lennard_jones(lj_coeff, sigma, r) -> np.ndarray:
+    def lennard_jones(lj_coeff, sigma, r) -> cp.ndarray:
         ''' 
         Lennard-Jones potentials
         v_LJ(r) = 4*epsilon[(sigma/r)^12-(sigma/r)^6]
@@ -145,11 +145,11 @@ class ArgonSim:
         """
         return dp_coef*dist_vecs*r**(-2)*((3.405e-10/r)**12-0.5*(3.405e-10/r)**6)
 
-    def _find_cutoff_ids(self) -> np.ndarray:
+    def _find_cutoff_ids(self) -> cp.ndarray:
         cutoff_mask = self.r_ij <= self.lennard_jones_cutoff
-        return np.nonzero(cutoff_mask)[0]
+        return cp.nonzero(cutoff_mask)[0]
 
-    def _compute_pair_potentials(self) -> np.ndarray:
+    def _compute_pair_potentials(self) -> cp.ndarray:
         """Compute the potentials from the cutoff list only. Return pairwise
         potentials of atoms"""
         pair_potentials = self.lennard_jones(
@@ -160,26 +160,26 @@ class ArgonSim:
         return pair_potentials
 
     @staticmethod
-    def _sum_pair_forces_1d(pair_forces_1d, pair_labels, idx_array) -> np.ndarray:
+    def _sum_pair_forces_1d(pair_forces_1d, pair_labels, idx_array) -> cp.ndarray:
         """
         Sum pairwise forces (i,j pairs) according the label ids. The directions
         of the pairwise forces are taken into account.
         """
         # force j to i
-        f_in = NI.sum(pair_forces_1d, pair_labels[:,0], idx_array)
+        f_in = NI.sum_labels(pair_forces_1d, pair_labels[:,0], idx_array)
         # force i to j
-        f_out = NI.sum(pair_forces_1d, pair_labels[:,1], idx_array)
+        f_out = NI.sum_labels(pair_forces_1d, pair_labels[:,1], idx_array)
         f_total = f_in - f_out
         return f_total
 
     @staticmethod
-    def _sum_pair_forces(pair_forces, pair_labels, coords_shape) -> np.ndarray:
+    def _sum_pair_forces(pair_forces, pair_labels, coords_shape) -> cp.ndarray:
         """
         Sum pairwise forces (i,j pairs) according the label ids. The directions
         of the pairwise forces are taken into account.
         """
         
-        f_total = np.zeros(coords_shape)
+        f_total = cp.zeros(coords_shape)
         for i in range(f_total.shape[0]):
             # force j to i
             f_total[i] += pair_forces[pair_labels[:,0] == i].sum(0)
@@ -191,7 +191,7 @@ class ArgonSim:
         # calculate pairwise force vectors (fx,fy,fz) from atom j to atom i
         fx, fy, fz = pair_forces.T
         # force vectors for each atom
-        f_atoms = np.empty(self.coords.shape)
+        f_atoms = cp.empty(self.coords.shape)
         for i, f1d in enumerate((fx, fy, fz)):
             # sum all pairwise forces by each dimension on each atom
             f_atoms[:,i] = self._sum_pair_forces_1d(
@@ -199,7 +199,7 @@ class ArgonSim:
             )
         return f_atoms
 
-    def get_accelerations(self, coords) -> np.ndarray:
+    def get_accelerations(self, coords) -> cp.ndarray:
         """
         Get accelerations from a set of coordinates. The pairwaise distance 
         vectors and distances (vector norm) will be determined first. The 
@@ -210,12 +210,12 @@ class ArgonSim:
         Args
             coords
             param : a set of coordinates of the Argon atoms at a given time step
-            type: np.array
+            type: cp.array
             
         Return
             acclerations
             param : acceleration vectors for each atom with shape (N, 3)
-            type : np.array
+            type : cp.array
         """
         id_pairs = self.id_pairs
         # dist vector from atom j to atom i

@@ -1,10 +1,97 @@
-# Brooks Lab at the University of Michigan, 2023
-
-"""Argon MD simulation engine based on Verlet algorithm"""
 from itertools import combinations, permutations
 import numpy as np
 from numpy import linalg as LA
 from scipy import ndimage as NI   # import the types
+from numba import njit
+from numba import void, uint32, float64
+
+@njit(void(float64[:,:], float64))
+def apply_pbc_dist(dist_vecs, box_len) -> np.ndarray:
+    """Apply periodic boundary conditions on distance vectors. Shortest 
+    distance vector will be determined from box_length and assigned 
+    to the distance array directly"""
+    ## This is deliberately written with for loops and flow control for complier
+    ## to vectorize and optimize. It is faster than numpy's boolean masks.
+    length_comp = box_len/2
+    dim1 = range(dist_vecs.shape[0])
+    dim2 = range(3)
+    for i in dim1:
+        for j in dim2:
+            cur_dist = dist_vecs[i,j]
+            if cur_dist > length_comp:
+                dist_vecs[i,j] = cur_dist - box_len
+            elif cur_dist < -length_comp:
+                dist_vecs[i,j] = cur_dist + box_len
+
+@njit(void(float64[:,:], float64))
+def apply_pbc_coord(coords, box_len) -> None:
+    """Apply periodic boundary conditions on coordinates. Any out of bound 
+    coord will be wrapped and place to the other side of the box. The new 
+    coords will be assigned to the coords array directly"""
+    dim1 = range(coords.shape[0])
+    dim2 = range(3)
+    for i in dim1:
+        for j in dim2:
+            cur_coord = coords[i,j]
+            if cur_coord > box_len:
+                coords[i,j] = cur_coord % box_len
+            elif cur_coord < 0:
+                coords[i,j] = box_len - ( -cur_coord % box_len)
+
+@njit
+def verlet(curr_x, last_x, accl, dt) -> np.ndarray:
+    """Verlet algorithm"""
+    return 2*curr_x-last_x+accl*dt**2
+
+@njit
+def lennard_jones(lj_coeff, sigma, r) -> np.ndarray:
+    ''' 
+    Lennard-Jones potentials
+    v_LJ(r) = 4*epsilon[(sigma/r)^12-(sigma/r)^6]
+    units in J
+    epsilon/k_b = 120K => epsilon: J (m^2 kg s^-2)
+    '''
+    return lj_coeff*((sigma/r)**12-(sigma/r)**6)
+
+@njit(float64[:,:](float64, float64[:], float64[:,:]))
+def del_potential(dp_coef, r, dist_vecs):
+    """Gradient operator on Lennard Jones potentials to find force vectors
+    """
+    force_vecs = np.empty_like(dist_vecs)
+    for i in range(3):
+        dist_1d = dist_vecs[:,i]
+        force_vecs[:,i] = dp_coef*dist_1d*r**(-2)*(
+            (3.405e-10/r)**12-0.5*(3.405e-10/r)**6
+        )
+    return force_vecs
+
+def _sum_pair_forces_1d(pair_forces_1d, pair_labels, idx_array) -> np.ndarray:
+    """
+    Sum pairwise forces (i,j pairs) according the label ids. The directions
+    of the pairwise forces are taken into account.
+    """
+    # force j to i
+    f_in = NI.sum(pair_forces_1d, pair_labels[:,0], idx_array)
+    # force i to j
+    f_out = NI.sum(pair_forces_1d, pair_labels[:,1], idx_array)
+    f_total = f_in - f_out
+    return f_total
+
+@njit(float64[:,:](float64[:,:], uint32[:,:], uint32))
+def sum_pair_forces(pair_forces, pair_labels, dim1) -> np.ndarray:
+    """
+    Sum pairwise forces (i,j pairs) according the label ids. The directions
+    of the pairwise forces are taken into account.
+    """
+    ## This is somehow slower than NI.sum after compiled
+    f_total = np.zeros((dim1, 3))
+    for i in range(f_total.shape[0]):
+        # force j to i
+        f_total[i] += pair_forces[pair_labels[:,0] == i].sum(0)
+        # force i to j
+        f_total[i] -= pair_forces[pair_labels[:,1] == i].sum(0)
+
+    return f_total
 
 class ArgonSim:
     """Simple molecular dynamics simulation engine for Argon systems. This is a
@@ -67,7 +154,8 @@ class ArgonSim:
         self.velo = self._init_velocities(temp, self.init_coords.shape)
         # combination of indices (i, j) for atom i and atom j
         self.id_pairs = np.array(
-            list(combinations(range(len(self.init_coords)),2))
+            list(combinations(range(len(self.init_coords)),2)),
+            dtype = np.uint32
         )
         self.coords = np.empty_like(self.init_coords, dtype=np.float64)
         self.r_ij = None
@@ -103,47 +191,6 @@ class ArgonSim:
         velo_std = (kbT_over_m)**0.5 # m/s
         init_velo = np.random.normal(0, velo_std, size)
         return init_velo
-    
-    @ staticmethod
-    def _apply_pbc_dist(dist_vecs, box_len) -> None:
-        """Apply periodic boundary conditions on distance vectors. Shortest 
-        distance vector will be determined from self.box_length and assigned 
-        to the distance array directly"""
-        mask = np.abs(dist_vecs) > box_len/2
-        dist_vecs[mask] -= np.sign(dist_vecs[mask])*box_len
-
-    @staticmethod
-    def _apply_pbc_coord(coords, box_len) -> None:
-        """Apply periodic boundary conditions on coordinates. Any out of bound 
-        coord will be wrapped and place to the other side of the box. The new 
-        coords will be assigned to the self.coords array directly"""
-        mask1 = coords > box_len
-        mask2 = coords < 0
-        wrapped_coords1 = coords[mask1] % box_len
-        wrapped_coords2 = box_len - ((-coords[mask2]) % box_len)
-        coords[mask1] = wrapped_coords1
-        coords[mask2] = wrapped_coords2
-
-    @staticmethod
-    def verlet(curr_x, last_x, accl, dt) -> np.ndarray:
-        """Verlet algorithm"""
-        return 2*curr_x-last_x+accl*dt**2
-
-    @staticmethod
-    def lennard_jones(lj_coeff, sigma, r) -> np.ndarray:
-        ''' 
-        Lennard-Jones potentials
-        v_LJ(r) = 4*epsilon[(sigma/r)^12-(sigma/r)^6]
-        units in J
-        epsilon/k_b = 120K => epsilon: J (m^2 kg s^-2)
-        '''
-        return lj_coeff*((sigma/r)**12-(sigma/r)**6)
-
-    @staticmethod
-    def del_potential(dp_coef, r, dist_vecs):
-        """Gradient operator on Lennard Jones potentials to find force vectors
-        """
-        return dp_coef*dist_vecs*r**(-2)*((3.405e-10/r)**12-0.5*(3.405e-10/r)**6)
 
     def _find_cutoff_ids(self) -> np.ndarray:
         cutoff_mask = self.r_ij <= self.lennard_jones_cutoff
@@ -152,40 +199,12 @@ class ArgonSim:
     def _compute_pair_potentials(self) -> np.ndarray:
         """Compute the potentials from the cutoff list only. Return pairwise
         potentials of atoms"""
-        pair_potentials = self.lennard_jones(
+        pair_potentials = lennard_jones(
             self.lj_coef,
             self.sigma,
             self.r_ij[self.cutoff_ids]
         )
         return pair_potentials
-
-    @staticmethod
-    def _sum_pair_forces_1d(pair_forces_1d, pair_labels, idx_array) -> np.ndarray:
-        """
-        Sum pairwise forces (i,j pairs) according the label ids. The directions
-        of the pairwise forces are taken into account.
-        """
-        # force j to i
-        f_in = NI.sum(pair_forces_1d, pair_labels[:,0], idx_array)
-        # force i to j
-        f_out = NI.sum(pair_forces_1d, pair_labels[:,1], idx_array)
-        f_total = f_in - f_out
-        return f_total
-
-    @staticmethod
-    def _sum_pair_forces(pair_forces, pair_labels, coords_shape) -> np.ndarray:
-        """
-        Sum pairwise forces (i,j pairs) according the label ids. The directions
-        of the pairwise forces are taken into account.
-        """
-        
-        f_total = np.zeros(coords_shape)
-        for i in range(f_total.shape[0]):
-            # force j to i
-            f_total[i] += pair_forces[pair_labels[:,0] == i].sum(0)
-            # force i to j
-            f_total[i] -= pair_forces[pair_labels[:,1] == i].sum(0)
-        return f_total
 
     def _get_atom_forces_ni_sum(self, pair_forces, pair_labels):
         # calculate pairwise force vectors (fx,fy,fz) from atom j to atom i
@@ -194,7 +213,7 @@ class ArgonSim:
         f_atoms = np.empty(self.coords.shape)
         for i, f1d in enumerate((fx, fy, fz)):
             # sum all pairwise forces by each dimension on each atom
-            f_atoms[:,i] = self._sum_pair_forces_1d(
+            f_atoms[:,i] = _sum_pair_forces_1d(
                 f1d, pair_labels, self._idx_array
             )
         return f_atoms
@@ -221,7 +240,7 @@ class ArgonSim:
         # dist vector from atom j to atom i
         dist_vecs = coords[id_pairs[:,0]] - coords[id_pairs[:,1]]
         # apply periodic boundary conditions on distances
-        self._apply_pbc_dist(dist_vecs, self.box_len)
+        apply_pbc_dist(dist_vecs, self.box_len)
         # update the pairwise euclidean distances from atom j to atom i
         self.r_ij = LA.norm(dist_vecs, axis = 1)
         # update the indices of r_ij that need are within the 2.5 sigma cutoff
@@ -229,12 +248,18 @@ class ArgonSim:
         # indices pair that are within cutoff
         effective_id_pairs = self.id_pairs[self.cutoff_ids]
         # pair forces from del operator
-        pair_forces = self.del_potential(
+        pair_forces = del_potential(
             self.del_pot_coef,
-            self.r_ij.reshape(-1,1)[self.cutoff_ids],
+            self.r_ij[self.cutoff_ids],
             dist_vecs[self.cutoff_ids]
         )
         f_atoms = self._get_atom_forces_ni_sum(pair_forces, effective_id_pairs)
+        # f_atoms = _sum_pair_forces(
+        #     pair_forces,
+        #     effective_id_pairs,
+        #     self.coords.shape[0]
+        # )
+
         # acceleration
         accl = f_atoms/(self.m_argon_kg)
         return accl
@@ -245,7 +270,7 @@ class ArgonSim:
         self.accl = self.get_accelerations(self.init_coords)
         self.pair_potentials = self._compute_pair_potentials()
         self.coords = self.init_coords+self.velo*self.dt+self.accl*self.dt**2/2
-        self._apply_pbc_coord(self.coords, self.box_len)
+        apply_pbc_coord(self.coords, self.box_len)
         self.last_coords = self.init_coords
 
     def step(self) -> None:
@@ -254,22 +279,20 @@ class ArgonSim:
         accelerations, coordinates, and last coordinates will be updated."""
         self.accl = self.get_accelerations(self.coords)
         self.pair_potentials = self._compute_pair_potentials()
-        new_coords = self.verlet(
+        new_coords = verlet(
             self.coords, self.last_coords, self.accl, self.dt
         )
-        self._apply_pbc_coord(new_coords, self.box_len)
+        apply_pbc_coord(new_coords, self.box_len)
         dx_2dt = new_coords - self.last_coords
-        self._apply_pbc_dist(dx_2dt, self.box_len)
+        apply_pbc_dist(dx_2dt, self.box_len)
         self.velo = dx_2dt/(2*self.dt)
         self.last_coords = self.coords
         self.coords = new_coords
 
     def step_velocity_verlet(self) -> None:
         self.coords = self.coords+self.velo*self.dt+self.accl*self.dt**2/2
-        self._apply_pbc_coord(self.coords, self.box_len)
+        apply_pbc_coord(self.coords, self.box_len)
         self.velo = self.velo+self.accl*self.dt/2
         self.accl = self.get_accelerations(self.coords)
         self.pair_potentials = self._compute_pair_potentials()
         self.velo = self.velo+self.accl*self.dt/2
-
-    

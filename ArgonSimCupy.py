@@ -21,7 +21,7 @@ class ArgonSim:
         n_cells : int,
         temp : float = 120,
         dt : float = 1e-14, # seconds
-        density : float = 1.16, # g/cm^3 @ 130K
+        density : float = 1.374, # g/cm^3
         lennard_jones_cutoff : float = 2.5 # 2.5 sigma is set as lennard jones potential cutoff
     ):
         """
@@ -48,7 +48,7 @@ class ArgonSim:
 
             density
             param : Density of the Argon system, unit in g/cm^3. Default to 
-                    1.16 g/cm^3 (@130K)
+                    1.374 g/cm^3 (@130K)
             type : float
         """
         if not isinstance(n_cells, int):
@@ -104,7 +104,7 @@ class ArgonSim:
         init_velo = cp.random.normal(0, velo_std, size)
         return init_velo
     
-    @ staticmethod
+    @staticmethod
     def _apply_pbc_dist(dist_vecs, box_len) -> None:
         """Apply periodic boundary conditions on distance vectors. Shortest 
         distance vector will be determined from self.box_length and assigned 

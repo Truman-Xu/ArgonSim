@@ -1,4 +1,4 @@
-# A Simple MD Simulation for Argon
+# A Simple MD Simulation Engine for Argon
 
-This is a reimplementation of the Verlet paper Phys. Rev. **159**, 98. https://doi.org/10.1103/PhysRev.159.98 
+This is a reimplementation of the Verlet paper Phys. Rev. **159**, 98. https://doi.org/10.1103/PhysRev.159.98
 The only difference is that this simulation model uses real units while Verlet used the reduced units.
